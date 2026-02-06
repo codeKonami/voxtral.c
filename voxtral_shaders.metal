@@ -219,3 +219,131 @@ kernel void causal_softmax(
         row[j] *= inv_sum;
     }
 }
+
+/* ========================================================================
+ * RoPE: apply rotary position embedding in-place.
+ * data: [n_heads * head_dim], freqs: [head_dim/2 * 2] = (cos,sin) pairs.
+ * One thread per (head, half_dim_index) pair.
+ * ======================================================================== */
+
+kernel void rope_apply(
+    device float *data [[buffer(0)]],
+    device const float *freqs [[buffer(1)]],
+    constant int &n_heads [[buffer(2)]],
+    constant int &head_dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int half_dim = head_dim / 2;
+    int total = n_heads * half_dim;
+    if ((int)gid >= total) return;
+
+    int head = (int)gid / half_dim;
+    int i = (int)gid % half_dim;
+
+    float cos_val = freqs[i * 2];
+    float sin_val = freqs[i * 2 + 1];
+
+    int base = head * head_dim;
+    float x0 = data[base + i * 2];
+    float x1 = data[base + i * 2 + 1];
+
+    data[base + i * 2]     = x0 * cos_val - x1 * sin_val;
+    data[base + i * 2 + 1] = x0 * sin_val + x1 * cos_val;
+}
+
+/* ========================================================================
+ * KV cache copy: write kv_dim floats to a position in the cache.
+ * cache: large buffer, data written at float_offset + gid.
+ * ======================================================================== */
+
+kernel void kv_cache_copy(
+    device float *cache [[buffer(0)]],
+    device const float *data [[buffer(1)]],
+    constant int &float_offset [[buffer(2)]],
+    constant int &kv_dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid < kv_dim) {
+        cache[float_offset + gid] = data[gid];
+    }
+}
+
+/* ========================================================================
+ * Single-token decoder attention (seq_q=1).
+ * One threadgroup per query head, 128 threads cooperate on dot products.
+ * K/V read from the KV cache buffer at a per-layer offset.
+ * Uses online softmax (single pass) with cooperative reductions.
+ * ======================================================================== */
+
+kernel void decoder_attention(
+    device const float *Q [[buffer(0)]],
+    device const float *K_cache [[buffer(1)]],
+    device const float *V_cache [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &n_heads [[buffer(4)]],
+    constant int &n_kv_heads [[buffer(5)]],
+    constant int &head_dim [[buffer(6)]],
+    constant int &kv_dim [[buffer(7)]],
+    constant int &seq_k [[buffer(8)]],
+    constant float &scale [[buffer(9)]],
+    constant int &window_size [[buffer(10)]],
+    constant int &q_pos [[buffer(11)]],
+    uint head_idx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if ((int)head_idx >= n_heads) return;
+
+    int gqa_ratio = n_heads / n_kv_heads;
+    int kv_head = (int)head_idx / gqa_ratio;
+
+    device const float *q_h = Q + head_idx * head_dim;
+    device float *out_h = out + head_idx * head_dim;
+
+    int valid_end = min(q_pos, seq_k - 1);
+    int valid_start = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+
+    threadgroup float shared_reduce[128];
+
+    /* Each thread loads one Q element (head_dim=128, tg_size=128) */
+    float q_val = (int)tid < head_dim ? q_h[tid] : 0.0f;
+
+    /* Online softmax: single pass over keys */
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc = 0.0f; /* V accumulator for this thread's dimension */
+
+    for (int j = valid_start; j <= valid_end; j++) {
+        device const float *k_j = K_cache + j * kv_dim + kv_head * head_dim;
+
+        /* Cooperative dot product: each thread multiplies one element */
+        float partial = (int)tid < head_dim ? q_val * k_j[tid] : 0.0f;
+
+        /* Parallel reduction to compute full dot product */
+        shared_reduce[tid] = partial;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_reduce[tid] += shared_reduce[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float score = shared_reduce[0] * scale;
+
+        /* Online softmax update */
+        float old_max = running_max;
+        running_max = fmax(running_max, score);
+        float correction = exp(old_max - running_max);
+        running_sum = running_sum * correction + exp(score - running_max);
+        acc = acc * correction;
+
+        /* Accumulate weighted V */
+        if ((int)tid < head_dim) {
+            device const float *v_j = V_cache + j * kv_dim + kv_head * head_dim;
+            acc += exp(score - running_max) * v_j[tid];
+        }
+    }
+
+    /* Normalize and write output */
+    if ((int)tid < head_dim) {
+        out_h[tid] = acc / (running_sum + 1e-10f);
+    }
+}

@@ -257,8 +257,13 @@ void vox_free(vox_ctx_t *ctx) {
 
     #undef FREE0
 
+#ifdef USE_METAL
+    vox_metal_shared_free(ctx->kv_cache_k);
+    vox_metal_shared_free(ctx->kv_cache_v);
+#else
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
+#endif
     free(ctx->enc_kv_cache_k);
     free(ctx->enc_kv_cache_v);
     free(ctx->ada_scale);
@@ -815,8 +820,18 @@ static void stream_run_decoder(vox_stream_t *s) {
 
         s->ctx->kv_cache_len = 0;
         s->ctx->kv_pos_offset = 0;
-        free(s->ctx->kv_cache_k); s->ctx->kv_cache_k = NULL;
-        free(s->ctx->kv_cache_v); s->ctx->kv_cache_v = NULL;
+#ifdef USE_METAL
+        vox_metal_shared_free(s->ctx->kv_cache_k);
+#else
+        free(s->ctx->kv_cache_k);
+#endif
+        s->ctx->kv_cache_k = NULL;
+#ifdef USE_METAL
+        vox_metal_shared_free(s->ctx->kv_cache_v);
+#else
+        free(s->ctx->kv_cache_v);
+#endif
+        s->ctx->kv_cache_v = NULL;
 
         int prefill_count = prompt_len - 1;
         vox_decoder_prefill(s->ctx, prompt_embeds, prefill_count);

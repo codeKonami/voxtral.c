@@ -190,6 +190,23 @@ int vox_metal_decoder_wo_ffn_logits(int dim, int q_dim, int hidden, int vocab_si
                                       float *logits_out);
 
 /*
+ * GPU-shared memory allocation (zero-copy between CPU and GPU).
+ * Returns a CPU pointer backed by a Metal shared buffer.
+ * Falls back to calloc if Metal is not available.
+ */
+void *vox_metal_shared_alloc(size_t size);
+void vox_metal_shared_free(void *ptr);
+
+/*
+ * Monolithic decoder step: all 26 layers + logits in ONE command buffer.
+ * Requires KV cache allocated with vox_metal_shared_alloc().
+ * GPU kernels for RoPE, KV cache write, and attention eliminate all
+ * CPU round-trips between layers. ctx is cast to vox_ctx_t* internally.
+ * Returns token ID. logits_out may be NULL.
+ */
+int vox_metal_decoder_full_step(void *ctx, const float *rope_freqs, float *logits);
+
+/*
  * Pre-warm the bf16->f16 cache for a weight tensor.
  * Call during model loading to avoid first-use latency.
  */

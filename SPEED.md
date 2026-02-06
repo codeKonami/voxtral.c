@@ -46,8 +46,26 @@
 - **Result: 38 → 32.5 ms/step (test_speech), 39 → 35.7 ms/step (jfk)**
 - **Cumulative from baseline: 43.2 → 32.5 ms/step (25% faster)**
 
+### Attempt 3: Monolithic decoder step — 1 command buffer (SUCCESS)
+- All 26 layers + logits in a SINGLE Metal command buffer
+- 3 new Metal compute shaders: rope_apply, kv_cache_copy, decoder_attention
+- KV cache allocated with MTLResourceStorageModeShared (zero-copy CPU/GPU)
+- GPU RoPE: applies rotary embeddings on Q and K (interleaved pair convention)
+- GPU KV cache write: copies K/V to shared cache at correct layer/position offset
+- GPU decoder attention: one threadgroup (128 threads) per head, cooperative dot products
+  - Online softmax (single pass): avoids second scan over keys
+  - First attempt with 1-thread-per-head: 77.9 ms/step (TERRIBLE — sequential per-key scan)
+  - Fixed with 128-thread cooperative kernel: 26.6 ms/step (great improvement)
+- Command buffers per token: 27 → 1
+- **Result: 32.5 → 26.6 ms/step (test_speech), 35.7 → 28.7 ms/step (jfk)**
+- **Cumulative from baseline: 43.2 → 26.6 ms/step (38% faster)**
+
 ### Next targets
 - Theoretical floor: ~23 ms (300 GB/s, 6.9 GB weights)
-- Remaining: 27 cmd bufs × ~0.3ms = ~8ms overhead
-- Gap: 32.5 - 23 = 9.5ms (some is cmd buf overhead, some is GPU compute overhead)
-- Ideas: GPU RoPE + GPU attention → fuse entire layer into 1 cmd buf (27 → 1)
+- Gap: 26.6 - 23 = 3.6ms
+- Ideas: optimize attention kernel further (SIMD intrinsics), encoder speedups
+
+## MLX Credits
+- If any optimization ideas or kernel code are taken from Apple MLX
+  (https://github.com/ml-explore/mlx), proper credits must be added to
+  both the README and the relevant source file.

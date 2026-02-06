@@ -40,6 +40,16 @@ static int g_shaders_initialized = 0;
 /* Persistent GPU x buffer for cross-layer decoder fusion */
 static id<MTLBuffer> g_dec_x = nil;
 
+/* New kernels for monolithic decoder step */
+static id<MTLComputePipelineState> g_rope_apply_pipeline = nil;
+static id<MTLComputePipelineState> g_kv_cache_copy_pipeline = nil;
+static id<MTLComputePipelineState> g_decoder_attention_pipeline = nil;
+
+/* GPU-shared memory tracking (zero-copy between CPU and GPU) */
+#define SHARED_ALLOC_MAX 8
+static struct { void *ptr; id<MTLBuffer> buf; } g_shared_allocs[SHARED_ALLOC_MAX];
+static int g_shared_count = 0;
+
 /* ========================================================================
  * BF16 -> F16 Conversion
  * MPS only supports mixed f32/f16 matmul, not f32/bf16.
@@ -357,6 +367,15 @@ static int init_shaders(void) {
         func = [g_shader_library newFunctionWithName:@"argmax_f32"];
         if (func) g_argmax_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
 
+        func = [g_shader_library newFunctionWithName:@"rope_apply"];
+        if (func) g_rope_apply_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
+        func = [g_shader_library newFunctionWithName:@"kv_cache_copy"];
+        if (func) g_kv_cache_copy_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
+        func = [g_shader_library newFunctionWithName:@"decoder_attention"];
+        if (func) g_decoder_attention_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+
         g_shaders_initialized = 1;
 
         if (vox_verbose >= 2) {
@@ -431,6 +450,15 @@ void vox_metal_shutdown(void) {
         g_causal_softmax_pipeline = nil;
         g_ada_scale_mul_pipeline = nil;
         g_argmax_pipeline = nil;
+        g_rope_apply_pipeline = nil;
+        g_kv_cache_copy_pipeline = nil;
+        g_decoder_attention_pipeline = nil;
+
+        /* Release shared allocs */
+        for (int i = 0; i < g_shared_count; i++)
+            g_shared_allocs[i].buf = nil;
+        g_shared_count = 0;
+
         g_shader_library = nil;
         g_shaders_initialized = 0;
 
@@ -2147,6 +2175,323 @@ void vox_metal_batched_attention(float *out,
         pool_release_buffer(bufScores);
         pool_release_buffer(bufOut);
     }
+}
+
+/* ========================================================================
+ * GPU-Shared Memory Allocation
+ * ======================================================================== */
+
+void *vox_metal_shared_alloc(size_t size) {
+    if (!g_initialized || g_shared_count >= SHARED_ALLOC_MAX) return calloc(1, size);
+    id<MTLBuffer> buf = [g_device newBufferWithLength:size
+                                              options:MTLResourceStorageModeShared];
+    if (!buf) return calloc(1, size);
+    void *ptr = [buf contents];
+    memset(ptr, 0, size);
+    g_shared_allocs[g_shared_count].ptr = ptr;
+    g_shared_allocs[g_shared_count].buf = buf;
+    g_shared_count++;
+    return ptr;
+}
+
+void vox_metal_shared_free(void *ptr) {
+    if (!ptr) return;
+    for (int i = 0; i < g_shared_count; i++) {
+        if (g_shared_allocs[i].ptr == ptr) {
+            g_shared_allocs[i].buf = nil;
+            g_shared_allocs[i] = g_shared_allocs[--g_shared_count];
+            return;
+        }
+    }
+    free(ptr); /* fallback: not a shared allocation */
+}
+
+static id<MTLBuffer> find_shared_buffer(void *ptr) {
+    for (int i = 0; i < g_shared_count; i++) {
+        if (g_shared_allocs[i].ptr == ptr) return g_shared_allocs[i].buf;
+    }
+    return nil;
+}
+
+/* ========================================================================
+ * Monolithic Decoder Step: all 26 layers + logits in ONE command buffer
+ * ======================================================================== */
+
+#include "voxtral.h"
+
+int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *logits_out) {
+    if (!g_initialized || !g_shaders_initialized || !g_dec_x) return -1;
+
+    vox_ctx_t *ctx = (vox_ctx_t *)ctx_ptr;
+    vox_decoder_t *dec = &ctx->decoder;
+
+    int dim = VOX_DEC_DIM;
+    int n_heads = VOX_DEC_HEADS;
+    int n_kv_heads = VOX_DEC_KV_HEADS;
+    int head_dim = VOX_DEC_HEAD_DIM;
+    int hidden = VOX_DEC_HIDDEN;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int pos = ctx->kv_cache_len;
+    int total_seq = pos + 1;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* Find GPU buffer handles for KV cache (allocated with shared_alloc) */
+    id<MTLBuffer> gpu_kv_k = find_shared_buffer(ctx->kv_cache_k);
+    id<MTLBuffer> gpu_kv_v = find_shared_buffer(ctx->kv_cache_v);
+    if (!gpu_kv_k || !gpu_kv_v) return -1;
+
+    int result = 0;
+
+    @autoreleasepool {
+        /* Scratch buffers — reused across all 26 layers within this cmd buf */
+        id<MTLBuffer> bufXnorm = pool_get_buffer(dim * sizeof(float));
+        id<MTLBuffer> bufQ = pool_get_buffer(q_dim * sizeof(float));
+        id<MTLBuffer> bufK = pool_get_buffer(kv_dim * sizeof(float));
+        id<MTLBuffer> bufV = pool_get_buffer(kv_dim * sizeof(float));
+        id<MTLBuffer> bufAttn = pool_get_buffer(q_dim * sizeof(float));
+        id<MTLBuffer> bufProj = pool_get_buffer(dim * sizeof(float));
+        id<MTLBuffer> bufGate = pool_get_buffer(hidden * sizeof(float));
+        id<MTLBuffer> bufUp = pool_get_buffer(hidden * sizeof(float));
+        id<MTLBuffer> bufFfnOut = pool_get_buffer(dim * sizeof(float));
+        id<MTLBuffer> bufLogits = pool_get_buffer((size_t)VOX_VOCAB_SIZE * sizeof(float));
+        id<MTLBuffer> bufArgmax = pool_get_buffer(sizeof(int));
+
+        /* Upload RoPE frequencies (small: 128 floats = 512 bytes) */
+        id<MTLBuffer> bufRope = pool_get_buffer(head_dim * sizeof(float));
+        if (bufRope) memcpy([bufRope contents], rope_freqs, head_dim * sizeof(float));
+
+        if (!bufXnorm || !bufQ || !bufK || !bufV || !bufAttn ||
+            !bufProj || !bufGate || !bufUp || !bufFfnOut ||
+            !bufLogits || !bufArgmax || !bufRope) {
+            pool_release_buffer(bufXnorm);
+            pool_release_buffer(bufQ);
+            pool_release_buffer(bufK);
+            pool_release_buffer(bufV);
+            pool_release_buffer(bufAttn);
+            pool_release_buffer(bufProj);
+            pool_release_buffer(bufGate);
+            pool_release_buffer(bufUp);
+            pool_release_buffer(bufFfnOut);
+            pool_release_buffer(bufLogits);
+            pool_release_buffer(bufArgmax);
+            pool_release_buffer(bufRope);
+            return -1;
+        }
+
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+
+        /* ---- 26 decoder layers ---- */
+        for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
+            vox_dec_layer_t *l = &dec->layers[layer];
+
+            /* If not first layer, encode wo+FFN for previous layer first */
+            if (layer > 0) {
+                vox_dec_layer_t *prev = &dec->layers[layer - 1];
+                const float *ada_s = ctx->ada_scale ?
+                    ctx->ada_scale + (size_t)(layer - 1) * dim : NULL;
+
+                encode_wo_ffn_steps(cmdBuffer, bufAttn, bufProj, bufXnorm,
+                                    bufGate, bufUp, bufFfnOut,
+                                    dim, q_dim, hidden,
+                                    prev->wo_weight_bf16,
+                                    prev->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
+                                    prev->w1_weight_bf16, prev->w3_weight_bf16,
+                                    prev->w2_weight_bf16);
+            }
+
+            /* RMSNorm + QKV projections */
+            encode_norm_qkv_steps(cmdBuffer, bufXnorm, bufQ, bufK, bufV,
+                                  dim, l->attention_norm, VOX_DEC_NORM_EPS,
+                                  l->wq_weight_bf16, q_dim,
+                                  l->wk_weight_bf16, kv_dim,
+                                  l->wv_weight_bf16, kv_dim);
+
+            /* RoPE on Q */
+            {
+                int n_threads = n_heads * (head_dim / 2);
+                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+                [enc setComputePipelineState:g_rope_apply_pipeline];
+                [enc setBuffer:bufQ offset:0 atIndex:0];
+                [enc setBuffer:bufRope offset:0 atIndex:1];
+                [enc setBytes:&n_heads length:sizeof(int) atIndex:2];
+                [enc setBytes:&head_dim length:sizeof(int) atIndex:3];
+                NSUInteger tg = MIN((NSUInteger)n_threads,
+                                    g_rope_apply_pipeline.maxTotalThreadsPerThreadgroup);
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)n_threads, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [enc endEncoding];
+            }
+
+            /* RoPE on K */
+            {
+                int n_threads = n_kv_heads * (head_dim / 2);
+                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+                [enc setComputePipelineState:g_rope_apply_pipeline];
+                [enc setBuffer:bufK offset:0 atIndex:0];
+                [enc setBuffer:bufRope offset:0 atIndex:1];
+                [enc setBytes:&n_kv_heads length:sizeof(int) atIndex:2];
+                [enc setBytes:&head_dim length:sizeof(int) atIndex:3];
+                NSUInteger tg = MIN((NSUInteger)n_threads,
+                                    g_rope_apply_pipeline.maxTotalThreadsPerThreadgroup);
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)n_threads, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [enc endEncoding];
+            }
+
+            /* Write K to GPU KV cache */
+            {
+                int offset = (int)((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
+                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+                [enc setComputePipelineState:g_kv_cache_copy_pipeline];
+                [enc setBuffer:gpu_kv_k offset:0 atIndex:0];
+                [enc setBuffer:bufK offset:0 atIndex:1];
+                [enc setBytes:&offset length:sizeof(int) atIndex:2];
+                [enc setBytes:&kv_dim length:sizeof(int) atIndex:3];
+                NSUInteger tg = MIN((NSUInteger)kv_dim,
+                                    g_kv_cache_copy_pipeline.maxTotalThreadsPerThreadgroup);
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [enc endEncoding];
+            }
+
+            /* Write V to GPU KV cache */
+            {
+                int offset = (int)((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
+                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+                [enc setComputePipelineState:g_kv_cache_copy_pipeline];
+                [enc setBuffer:gpu_kv_v offset:0 atIndex:0];
+                [enc setBuffer:bufV offset:0 atIndex:1];
+                [enc setBytes:&offset length:sizeof(int) atIndex:2];
+                [enc setBytes:&kv_dim length:sizeof(int) atIndex:3];
+                NSUInteger tg = MIN((NSUInteger)kv_dim,
+                                    g_kv_cache_copy_pipeline.maxTotalThreadsPerThreadgroup);
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_dim, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [enc endEncoding];
+            }
+
+            /* Single-token attention (all heads in parallel) */
+            {
+                size_t layer_kv_offset = (size_t)layer * ctx->kv_cache_max * kv_dim * sizeof(float);
+                int window = VOX_DEC_WINDOW;
+                int q_pos = ctx->kv_pos_offset + pos;
+
+                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+                [enc setComputePipelineState:g_decoder_attention_pipeline];
+                [enc setBuffer:bufQ offset:0 atIndex:0];
+                [enc setBuffer:gpu_kv_k offset:layer_kv_offset atIndex:1];
+                [enc setBuffer:gpu_kv_v offset:layer_kv_offset atIndex:2];
+                [enc setBuffer:bufAttn offset:0 atIndex:3];
+                [enc setBytes:&n_heads length:sizeof(int) atIndex:4];
+                [enc setBytes:&n_kv_heads length:sizeof(int) atIndex:5];
+                [enc setBytes:&head_dim length:sizeof(int) atIndex:6];
+                [enc setBytes:&kv_dim length:sizeof(int) atIndex:7];
+                [enc setBytes:&total_seq length:sizeof(int) atIndex:8];
+                [enc setBytes:&scale length:sizeof(float) atIndex:9];
+                [enc setBytes:&window length:sizeof(int) atIndex:10];
+                [enc setBytes:&q_pos length:sizeof(int) atIndex:11];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+            }
+        }
+
+        /* ---- Final: wo+FFN for last layer + logits + argmax ---- */
+        {
+            vox_dec_layer_t *last = &dec->layers[VOX_DEC_LAYERS - 1];
+            const float *ada_s = ctx->ada_scale ?
+                ctx->ada_scale + (size_t)(VOX_DEC_LAYERS - 1) * dim : NULL;
+
+            encode_wo_ffn_steps(cmdBuffer, bufAttn, bufProj, bufXnorm,
+                                bufGate, bufUp, bufFfnOut,
+                                dim, q_dim, hidden,
+                                last->wo_weight_bf16,
+                                last->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
+                                last->w1_weight_bf16, last->w3_weight_bf16,
+                                last->w2_weight_bf16);
+
+            /* Final RMSNorm */
+            id<MTLBuffer> bufFinalNorm = get_cached_weight_buffer(dec->norm,
+                                                                    dim * sizeof(float));
+            {
+                float eps = VOX_DEC_NORM_EPS;
+                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+                [enc setComputePipelineState:g_rms_norm_pipeline];
+                [enc setBuffer:g_dec_x offset:0 atIndex:0];
+                [enc setBuffer:bufFinalNorm offset:0 atIndex:1];
+                [enc setBuffer:bufXnorm offset:0 atIndex:2];
+                [enc setBytes:&dim length:sizeof(int) atIndex:3];
+                [enc setBytes:&eps length:sizeof(float) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+
+            /* Logits = x_norm @ tok_emb^T */
+            id<MTLBuffer> bufEmb = get_cached_bf16_as_f16_buffer(
+                dec->tok_embeddings_bf16, (size_t)VOX_VOCAB_SIZE * dim);
+            {
+                int vocab = VOX_VOCAB_SIZE;
+                MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:1 columns:dim
+                                    rowBytes:dim * sizeof(float)
+                                    dataType:MPSDataTypeFloat32];
+                MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:vocab columns:dim
+                                    rowBytes:dim * sizeof(uint16_t)
+                                    dataType:MPSDataTypeFloat16];
+                MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+                    matrixDescriptorWithRows:1 columns:vocab
+                                    rowBytes:vocab * sizeof(float)
+                                    dataType:MPSDataTypeFloat32];
+                MPSMatrix *matIn = [[MPSMatrix alloc] initWithBuffer:bufXnorm descriptor:descIn];
+                MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufEmb descriptor:descW];
+                MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufLogits descriptor:descOut];
+                MPSMatrixMultiplication *mm =
+                    get_cached_matmul_op(NO, YES, 1, vocab, dim, 1.0, 0.0);
+                if (mm)
+                    [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matIn
+                                  rightMatrix:matW resultMatrix:matOut];
+            }
+
+            /* Argmax on GPU */
+            {
+                int vocab = VOX_VOCAB_SIZE;
+                id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+                [enc setComputePipelineState:g_argmax_pipeline];
+                [enc setBuffer:bufLogits offset:0 atIndex:0];
+                [enc setBuffer:bufArgmax offset:0 atIndex:1];
+                [enc setBytes:&vocab length:sizeof(int) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+        }
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        result = ((int *)[bufArgmax contents])[0];
+        if (logits_out)
+            memcpy(logits_out, [bufLogits contents], (size_t)VOX_VOCAB_SIZE * sizeof(float));
+
+        pool_release_buffer(bufXnorm);
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufV);
+        pool_release_buffer(bufAttn);
+        pool_release_buffer(bufProj);
+        pool_release_buffer(bufGate);
+        pool_release_buffer(bufUp);
+        pool_release_buffer(bufFfnOut);
+        pool_release_buffer(bufLogits);
+        pool_release_buffer(bufArgmax);
+        pool_release_buffer(bufRope);
+    }
+
+    ctx->kv_cache_len = pos + 1;
+    return result;
 }
 
 /* ========================================================================

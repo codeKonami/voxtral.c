@@ -115,8 +115,16 @@ static int kv_cache_init(vox_ctx_t *ctx, int max_seq) {
     int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM; /* 8 * 128 = 1024 */
     size_t cache_size = (size_t)VOX_DEC_LAYERS * max_seq * kv_dim * sizeof(float);
 
-    ctx->kv_cache_k = (float *)calloc(1, cache_size);
-    ctx->kv_cache_v = (float *)calloc(1, cache_size);
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        ctx->kv_cache_k = (float *)vox_metal_shared_alloc(cache_size);
+        ctx->kv_cache_v = (float *)vox_metal_shared_alloc(cache_size);
+    } else
+#endif
+    {
+        ctx->kv_cache_k = (float *)calloc(1, cache_size);
+        ctx->kv_cache_v = (float *)calloc(1, cache_size);
+    }
     ctx->kv_cache_len = 0;
     ctx->kv_cache_max = max_seq;
     /* kv_pos_offset is NOT reset here — caller manages it */
@@ -137,9 +145,26 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
     size_t old_stride = (size_t)ctx->kv_cache_max * kv_dim;
     size_t total = (size_t)VOX_DEC_LAYERS * new_stride * sizeof(float);
 
-    float *new_k = (float *)calloc(1, total);
-    float *new_v = (float *)calloc(1, total);
-    if (!new_k || !new_v) { free(new_k); free(new_v); return -1; }
+    float *new_k, *new_v;
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        new_k = (float *)vox_metal_shared_alloc(total);
+        new_v = (float *)vox_metal_shared_alloc(total);
+    } else
+#endif
+    {
+        new_k = (float *)calloc(1, total);
+        new_v = (float *)calloc(1, total);
+    }
+    if (!new_k || !new_v) {
+#ifdef USE_METAL
+        vox_metal_shared_free(new_k);
+        vox_metal_shared_free(new_v);
+#else
+        free(new_k); free(new_v);
+#endif
+        return -1;
+    }
 
     size_t copy = (size_t)ctx->kv_cache_len * kv_dim * sizeof(float);
     for (int l = 0; l < VOX_DEC_LAYERS; l++) {
@@ -147,8 +172,13 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
         memcpy(new_v + l * new_stride, ctx->kv_cache_v + l * old_stride, copy);
     }
 
+#ifdef USE_METAL
+    vox_metal_shared_free(ctx->kv_cache_k);
+    vox_metal_shared_free(ctx->kv_cache_v);
+#else
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
+#endif
     ctx->kv_cache_k = new_k;
     ctx->kv_cache_v = new_v;
     ctx->kv_cache_max = new_max;
@@ -379,71 +409,16 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
 
 #ifdef USE_METAL
     if (vox_metal_available()) {
-        /* Cross-layer fused path: keeps x on GPU across all layers.
-         * 27 command buffers per token (vs 53 without cross-layer fusion). */
+        /* Try monolithic GPU path: all 26 layers + logits in ONE command buffer.
+         * RoPE, KV cache writes, and attention all run on GPU.
+         * Requires shared KV cache (allocated via vox_metal_shared_alloc). */
         vox_metal_decoder_start(x, dim);
+        int token = vox_metal_decoder_full_step(ctx, rope_freqs, logits);
+        vox_metal_decoder_end();
+        if (token >= 0) return token;
 
-        /* Layer 0: norm + QKV only */
-        vox_metal_decoder_norm_qkv(dim,
-            dec->layers[0].attention_norm, VOX_DEC_NORM_EPS,
-            dec->layers[0].wq_weight_bf16, q_dim,
-            dec->layers[0].wk_weight_bf16, kv_dim,
-            dec->layers[0].wv_weight_bf16, kv_dim,
-            q, k, v);
-
-        vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
-        vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
-        memcpy(kv_cache_k_at(ctx, 0, pos), k, kv_dim * sizeof(float));
-        memcpy(kv_cache_v_at(ctx, 0, pos), v, kv_dim * sizeof(float));
-        vox_causal_attention(attn_out, q,
-                             kv_cache_k_at(ctx, 0, 0), kv_cache_v_at(ctx, 0, 0),
-                             1, pos + 1, n_heads, n_kv_heads,
-                             head_dim, scale, VOX_DEC_WINDOW, pos);
-
-        /* Layers 1..25: fused wo_ffn[prev] + norm_qkv[curr] */
-        for (int layer = 1; layer < VOX_DEC_LAYERS; layer++) {
-            vox_dec_layer_t *prev = &dec->layers[layer - 1];
-            vox_dec_layer_t *curr = &dec->layers[layer];
-            const float *ada_s = ctx->ada_scale ?
-                ctx->ada_scale + (size_t)(layer - 1) * dim : NULL;
-
-            vox_metal_decoder_wo_ffn_next_qkv(dim, q_dim, hidden,
-                attn_out, prev->wo_weight_bf16,
-                prev->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
-                prev->w1_weight_bf16, prev->w3_weight_bf16, prev->w2_weight_bf16,
-                curr->attention_norm,
-                curr->wq_weight_bf16, q_dim,
-                curr->wk_weight_bf16, kv_dim,
-                curr->wv_weight_bf16, kv_dim,
-                q, k, v);
-
-            vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
-            vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
-            memcpy(kv_cache_k_at(ctx, layer, pos), k, kv_dim * sizeof(float));
-            memcpy(kv_cache_v_at(ctx, layer, pos), v, kv_dim * sizeof(float));
-            vox_causal_attention(attn_out, q,
-                                 kv_cache_k_at(ctx, layer, 0),
-                                 kv_cache_v_at(ctx, layer, 0),
-                                 1, pos + 1, n_heads, n_kv_heads,
-                                 head_dim, scale, VOX_DEC_WINDOW, pos);
-        }
-
-        /* Final: wo_ffn[25] + logits + argmax */
-        {
-            vox_dec_layer_t *last = &dec->layers[VOX_DEC_LAYERS - 1];
-            const float *ada_s = ctx->ada_scale ?
-                ctx->ada_scale + (size_t)(VOX_DEC_LAYERS - 1) * dim : NULL;
-
-            int token = vox_metal_decoder_wo_ffn_logits(dim, q_dim, hidden,
-                VOX_VOCAB_SIZE, attn_out, last->wo_weight_bf16,
-                last->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
-                last->w1_weight_bf16, last->w3_weight_bf16, last->w2_weight_bf16,
-                dec->norm, dec->tok_embeddings_bf16, logits);
-
-            vox_metal_decoder_end();
-            ctx->kv_cache_len = pos + 1;
-            return token;
-        }
+        /* full_step returned -1 (shared KV cache not available).
+         * Fall through to CPU path. */
     }
 #endif
 
