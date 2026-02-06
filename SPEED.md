@@ -60,10 +60,26 @@
 - **Result: 32.5 → 26.6 ms/step (test_speech), 35.7 → 28.7 ms/step (jfk)**
 - **Cumulative from baseline: 43.2 → 26.6 ms/step (38% faster)**
 
+### Attempt 4: SIMD attention (SUCCESS)
+- Replaced threadgroup barrier reductions with simd_sum() in decoder_attention kernel
+- 4 SIMD groups of 32 threads, simd_sum for dot product, cross-SIMD via threadgroup
+- **Result: 26.6 → 25.3 ms/step (test_speech)**
+
+### Attempt 5: Merged weight matrices (SUCCESS)
+- Merged w1+w3 into single MPS matmul in FFN (saves 1 MPS encode per layer)
+  - get_merged_f16_2(): concatenates two bf16 weight buffers into one f16 buffer
+  - bufGate now sized hidden*2, silu/mul use buffer offsets
+- Merged Q+K+V into single MPS matmul in QKV projection (saves 2 MPS encodes per layer)
+  - get_merged_f16_3(): concatenates three bf16 weight buffers into one f16 buffer
+  - Single bufQKV output, downstream RoPE/KV-cache/attention use buffer offsets
+- Total: 3 fewer MPS matmul encodes per layer × 26 layers = 78 fewer encodes
+- **Result: 25.3 → 23.7 ms/step (test_speech), ~24.9 ms/step (jfk)**
+- **Cumulative from baseline: 43.2 → 23.7 ms/step (45% faster)**
+
 ### Next targets
 - Theoretical floor: ~23 ms (300 GB/s, 6.9 GB weights)
-- Gap: 26.6 - 23 = 3.6ms
-- Ideas: optimize attention kernel further (SIMD intrinsics), encoder speedups
+- Gap: 23.7 - 23 = 0.7ms (very close to memory bandwidth limit)
+- Ideas: encoder speedups, attention kernel optimizations for longer sequences
 
 ## MLX Credits
 - If any optimization ideas or kernel code are taken from Apple MLX
