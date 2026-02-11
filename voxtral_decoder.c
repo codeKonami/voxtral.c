@@ -288,7 +288,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     float *rope_freqs = (float *)malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
     vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
 
-    /* GPU monolithic prefill: all 26 layers in one command buffer */
+    /* GPU monolithic prefill: all layers in one command buffer */
 #ifdef USE_METAL
     if (vox_metal_available()) {
         vox_metal_decoder_prefill_step(ctx, x, seq_len, rope_freqs);
@@ -477,6 +477,12 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
 
         /* full_step returned -1 (shared KV cache not available).
          * Fall through to CPU path. */
+    }
+#endif
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        int token = vox_cuda_decoder_step(ctx, x, rope_freqs, logits);
+        if (token >= 0) return token;
     }
 #endif
 

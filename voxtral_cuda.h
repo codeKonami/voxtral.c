@@ -68,6 +68,33 @@ void vox_cuda_causal_attention(float *out, const float *Q, const float *K, const
 void vox_cuda_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
 
 /*
+ * Pre-warm the f32 weight cache (norms, biases, ada_scale).
+ */
+void vox_cuda_warmup_f32(const float *f32_weights, size_t num_elements);
+
+/*
+ * Monolithic decoder step: all 26 layers + logits on GPU, single sync.
+ * ctx is cast to vox_ctx_t* internally.
+ * input_embeds: [DEC_DIM] f32 on CPU.
+ * rope_freqs: [HEAD_DIM] f32 on CPU (pre-computed for this position).
+ * logits: [VOCAB_SIZE] f32 on CPU (output).
+ * Returns argmax token ID, or -1 on failure.
+ */
+int vox_cuda_decoder_step(void *ctx, const float *input_embeds,
+                           const float *rope_freqs, float *logits);
+
+/*
+ * Monolithic encoder step: all 32 layers + final norm on GPU, single sync.
+ * ctx is cast to vox_ctx_t* internally.
+ * x: [new_len, ENC_DIM] f32 on CPU (in/out: overwritten with result).
+ * rope_freqs: [new_len, HEAD_DIM/2, 2] f32 on CPU.
+ * cache_len: current KV cache length (before this chunk).
+ * Returns 0 on success, -1 on failure.
+ */
+int vox_cuda_encoder_step(void *ctx, float *x, int new_len,
+                           const float *rope_freqs, int cache_len);
+
+/*
  * GPU-shared memory allocation (unified memory, accessible from CPU and GPU).
  * Returns a pointer usable from both CPU and GPU.
  * Falls back to calloc if CUDA is not available.

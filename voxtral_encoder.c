@@ -514,7 +514,7 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
     float *rope_freqs = ctx->enc_inc_rope_freqs;
     vox_compute_rope_freqs(rope_freqs, positions, new_len, head_dim, VOX_ROPE_THETA);
 
-    /* GPU monolithic path: all 32 layers in one command buffer */
+    /* GPU monolithic path: all layers in one command buffer */
 #ifdef USE_METAL
     if (vox_metal_available() && ctx->enc_kv_cache_is_shared) {
         if (vox_metal_encoder_full_step(ctx, x, new_len, rope_freqs, cache_len) == 0) {
@@ -523,6 +523,14 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
             return x;
         }
         /* Fall through to CPU path on failure */
+    }
+#endif
+#ifdef USE_CUDA
+    if (vox_cuda_available() && ctx->enc_kv_cache_is_shared) {
+        if (vox_cuda_encoder_step(ctx, x, new_len, rope_freqs, cache_len) == 0) {
+            *out_len = new_len;
+            return x;
+        }
     }
 #endif
 

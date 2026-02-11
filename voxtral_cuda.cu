@@ -2,16 +2,20 @@
  * voxtral_cuda.cu - CUDA GPU acceleration for Voxtral inference
  *
  * Phase 1: cuBLAS matmul with BF16 weight caching.
- * Weights are uploaded to GPU once and reused. Activations are copied per call.
+ * Phase 2: Causal attention kernel with online softmax.
+ * Phase 3: Full GPU pipeline — element-wise kernels, device-pointer matmul,
+ *          monolithic decoder/encoder steps (no CPU↔GPU round-trips per layer).
  */
 
 #include "voxtral_cuda.h"
+#include "voxtral.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* ========================================================================
  * Global State
@@ -90,6 +94,58 @@ static void *weight_cache_get_or_upload(const uint16_t *cpu_ptr, size_t num_elem
 }
 
 /* ========================================================================
+ * F32 Weight Cache
+ *
+ * Maps CPU f32 pointer -> GPU device f32 pointer.
+ * Used for norm weights, biases, and ada_scale (small tensors).
+ * ======================================================================== */
+
+#define F32_CACHE_SIZE 512
+
+typedef struct {
+    const float *cpu_ptr;
+    float *gpu_ptr;
+    size_t num_elements;
+} f32_cache_entry_t;
+
+static f32_cache_entry_t g_f32_cache[F32_CACHE_SIZE];
+
+static float *f32_cache_get_or_upload(const float *cpu_ptr, size_t num_elements) {
+    if (!cpu_ptr) return NULL;
+
+    /* Look up */
+    unsigned long hash = ((unsigned long)cpu_ptr >> 4) % F32_CACHE_SIZE;
+    for (int i = 0; i < F32_CACHE_SIZE; i++) {
+        int idx = (hash + i) % F32_CACHE_SIZE;
+        if (g_f32_cache[idx].cpu_ptr == cpu_ptr) return g_f32_cache[idx].gpu_ptr;
+        if (g_f32_cache[idx].cpu_ptr == NULL) break;
+    }
+
+    /* Upload */
+    float *gpu_ptr = NULL;
+    size_t bytes = num_elements * sizeof(float);
+    if (cudaMalloc((void **)&gpu_ptr, bytes) != cudaSuccess) return NULL;
+    cudaMemcpyAsync(gpu_ptr, cpu_ptr, bytes, cudaMemcpyHostToDevice, g_stream);
+    cudaStreamSynchronize(g_stream);
+    g_memory_used += bytes;
+
+    /* Insert */
+    for (int i = 0; i < F32_CACHE_SIZE; i++) {
+        int idx = (hash + i) % F32_CACHE_SIZE;
+        if (g_f32_cache[idx].cpu_ptr == NULL) {
+            g_f32_cache[idx].cpu_ptr = cpu_ptr;
+            g_f32_cache[idx].gpu_ptr = gpu_ptr;
+            g_f32_cache[idx].num_elements = num_elements;
+            return gpu_ptr;
+        }
+    }
+
+    cudaFree(gpu_ptr);
+    g_memory_used -= bytes;
+    return NULL;
+}
+
+/* ========================================================================
  * Activation Buffer Pool
  *
  * Reusable GPU buffers for transient activation/output data.
@@ -161,6 +217,30 @@ static void pool_free(void *ptr) {
 }
 
 /* ========================================================================
+ * Persistent GPU Buffers (forward declarations for shutdown)
+ * ======================================================================== */
+
+/* Decoder: fixed-size single-token buffers */
+static struct {
+    float *x, *x_norm, *q, *k, *v;
+    float *attn_out, *proj_out;
+    float *gate, *up, *ffn_out;
+    float *rope_freqs, *logits;
+    float *base;
+    int allocated;
+} g_dec_bufs;
+
+/* Encoder: variable-size buffers */
+static struct {
+    float *x, *x_norm, *q, *k, *v;
+    float *attn_out, *proj_out;
+    float *gate, *up, *ffn_out;
+    float *rope_freqs;
+    float *base;
+    int capacity;
+} g_enc_bufs;
+
+/* ========================================================================
  * Lifecycle
  * ======================================================================== */
 
@@ -210,6 +290,7 @@ extern "C" int vox_cuda_init(void) {
 
     /* Clear caches */
     memset(g_weight_cache, 0, sizeof(g_weight_cache));
+    memset(g_f32_cache, 0, sizeof(g_f32_cache));
     memset(g_pool, 0, sizeof(g_pool));
     g_memory_used = 0;
 
@@ -224,7 +305,7 @@ extern "C" int vox_cuda_available(void) {
 extern "C" void vox_cuda_shutdown(void) {
     if (!g_initialized) return;
 
-    /* Free weight cache */
+    /* Free bf16 weight cache */
     for (int i = 0; i < WEIGHT_CACHE_SIZE; i++) {
         if (g_weight_cache[i].gpu_ptr) {
             cudaFree(g_weight_cache[i].gpu_ptr);
@@ -232,6 +313,21 @@ extern "C" void vox_cuda_shutdown(void) {
             g_weight_cache[i].cpu_ptr = NULL;
         }
     }
+
+    /* Free f32 weight cache */
+    for (int i = 0; i < F32_CACHE_SIZE; i++) {
+        if (g_f32_cache[i].gpu_ptr) {
+            cudaFree(g_f32_cache[i].gpu_ptr);
+            g_f32_cache[i].gpu_ptr = NULL;
+            g_f32_cache[i].cpu_ptr = NULL;
+        }
+    }
+
+    /* Free persistent GPU buffers */
+    if (g_dec_bufs.base) { cudaFree(g_dec_bufs.base); }
+    memset(&g_dec_bufs, 0, sizeof(g_dec_bufs));
+    if (g_enc_bufs.base) { cudaFree(g_enc_bufs.base); }
+    memset(&g_enc_bufs, 0, sizeof(g_enc_bufs));
 
     /* Free pool buffers */
     for (int i = 0; i < POOL_SIZE; i++) {
@@ -399,6 +495,205 @@ extern "C" void vox_cuda_causal_attention(
 }
 
 /* ========================================================================
+ * Element-wise CUDA Kernels
+ * ======================================================================== */
+
+/* RMS Norm: out[s,d] = (x[s,d] / rms) * weight[d]
+ * Grid: (seq_len), Block: (256). Each block handles one sequence position. */
+__global__ void kernel_rms_norm(float *out, const float *x, const float *weight,
+                                int hidden, float eps) {
+    int s = blockIdx.x;
+    int tid = threadIdx.x;
+    const float *row = x + (size_t)s * hidden;
+    float *out_row = out + (size_t)s * hidden;
+
+    extern __shared__ float sdata[];
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden; i += blockDim.x)
+        sum_sq += row[i] * row[i];
+    sdata[tid] = sum_sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+
+    float rms = rsqrtf(sdata[0] / (float)hidden + eps);
+    for (int i = tid; i < hidden; i += blockDim.x)
+        out_row[i] = row[i] * rms * weight[i];
+}
+
+__global__ void kernel_silu(float *x, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float val = x[idx];
+        x[idx] = val / (1.0f + expf(-val));
+    }
+}
+
+__global__ void kernel_gelu(float *x, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float val = x[idx];
+        float inner = 0.7978845608f * (val + 0.044715f * val * val * val);
+        x[idx] = 0.5f * val * (1.0f + tanhf(inner));
+    }
+}
+
+__global__ void kernel_add_inplace(float *a, const float *b, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) a[idx] += b[idx];
+}
+
+__global__ void kernel_mul_inplace(float *a, const float *b, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) a[idx] *= b[idx];
+}
+
+/* Apply RoPE: rotate pairs by (cos, sin) freqs.
+ * x: [seq, heads * head_dim], freqs: [seq, head_dim/2, 2]
+ * Grid: (seq * heads), Block: (head_dim/2) */
+__global__ void kernel_apply_rope(float *x, const float *freqs,
+                                   int seq, int heads, int head_dim) {
+    int sh = blockIdx.x;
+    int s = sh / heads;
+    int h = sh % heads;
+    int pair = threadIdx.x;
+    int half = head_dim / 2;
+
+    float *row = x + (size_t)s * heads * head_dim + h * head_dim;
+    const float *freq_row = freqs + (size_t)s * half * 2;
+
+    float cos_val = freq_row[pair * 2];
+    float sin_val = freq_row[pair * 2 + 1];
+    float x0 = row[pair * 2];
+    float x1 = row[pair * 2 + 1];
+    row[pair * 2]     = x0 * cos_val - x1 * sin_val;
+    row[pair * 2 + 1] = x0 * sin_val + x1 * cos_val;
+}
+
+/* Ada scale: x[i] *= (1 + ada[i % dim]) */
+__global__ void kernel_ada_scale(float *x, const float *ada, int n, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) x[idx] *= (1.0f + ada[idx % dim]);
+}
+
+/* Bias add: data[s, d] += bias[d] */
+__global__ void kernel_bias_add(float *data, const float *bias, int n, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) data[idx] += bias[idx % dim];
+}
+
+/* ========================================================================
+ * Device-pointer Matrix Multiplication
+ *
+ * Like vox_cuda_sgemm_bf16 but A and C are already on GPU.
+ * No host<->device copies — only the F32->BF16 conversion of A.
+ * ======================================================================== */
+
+static void sgemm_bf16_dev(int M, int N, int K,
+                            const float *d_A,
+                            const uint16_t *B_bf16_cpu,
+                            float *d_C) {
+    void *d_B = weight_cache_get_or_upload(B_bf16_cpu, (size_t)N * K);
+    if (!d_B) return;
+
+    size_t a_bf16_bytes = (size_t)M * K * sizeof(__nv_bfloat16);
+    void *d_A_bf16 = pool_alloc(a_bf16_bytes);
+    if (!d_A_bf16) return;
+
+    int total = M * K;
+    kernel_f32_to_bf16<<<(total + 255) / 256, 256, 0, g_stream>>>(
+        (__nv_bfloat16 *)d_A_bf16, d_A, total);
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(g_cublas,
+                 CUBLAS_OP_T, CUBLAS_OP_N,
+                 N, M, K,
+                 &alpha,
+                 d_B, CUDA_R_16BF, K,
+                 d_A_bf16, CUDA_R_16BF, K,
+                 &beta,
+                 d_C, CUDA_R_32F, N,
+                 CUBLAS_COMPUTE_32F,
+                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    pool_free(d_A_bf16);
+}
+
+/* ========================================================================
+ * Persistent GPU Buffer Allocation
+ * ======================================================================== */
+
+static int ensure_dec_gpu_bufs(void) {
+    if (g_dec_bufs.allocated) return 0;
+    int dim = VOX_DEC_DIM;
+    int q_dim = VOX_DEC_HEADS * VOX_DEC_HEAD_DIM;
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
+    int hidden = VOX_DEC_HIDDEN;
+    int head_dim = VOX_DEC_HEAD_DIM;
+
+    size_t total = (size_t)(dim + dim + q_dim + kv_dim + kv_dim + q_dim + dim +
+                   hidden + hidden + dim + head_dim + VOX_VOCAB_SIZE) * sizeof(float);
+    float *buf = NULL;
+    if (cudaMalloc((void **)&buf, total) != cudaSuccess) return -1;
+    g_memory_used += total;
+
+    float *p = buf;
+    g_dec_bufs.x = p;          p += dim;
+    g_dec_bufs.x_norm = p;     p += dim;
+    g_dec_bufs.q = p;          p += q_dim;
+    g_dec_bufs.k = p;          p += kv_dim;
+    g_dec_bufs.v = p;          p += kv_dim;
+    g_dec_bufs.attn_out = p;   p += q_dim;
+    g_dec_bufs.proj_out = p;   p += dim;
+    g_dec_bufs.gate = p;       p += hidden;
+    g_dec_bufs.up = p;         p += hidden;
+    g_dec_bufs.ffn_out = p;    p += dim;
+    g_dec_bufs.rope_freqs = p; p += head_dim;
+    g_dec_bufs.logits = p;
+
+    g_dec_bufs.base = buf;
+    g_dec_bufs.allocated = 1;
+    return 0;
+}
+
+static int ensure_enc_gpu_bufs(int new_len) {
+    if (new_len <= g_enc_bufs.capacity) return 0;
+    if (g_enc_bufs.base) { cudaFree(g_enc_bufs.base); g_enc_bufs.base = NULL; }
+
+    int dim = VOX_ENC_DIM;
+    int qkv_dim = VOX_ENC_HEADS * VOX_ENC_HEAD_DIM;
+    int hidden = VOX_ENC_HIDDEN;
+    int head_dim = VOX_ENC_HEAD_DIM;
+
+    size_t per_pos = (size_t)(dim + dim + qkv_dim*3 + qkv_dim + dim +
+                     hidden + hidden + dim + head_dim) * sizeof(float);
+    size_t total = per_pos * new_len;
+    float *buf = NULL;
+    if (cudaMalloc((void **)&buf, total) != cudaSuccess) return -1;
+    g_memory_used += total;
+
+    float *p = buf;
+    g_enc_bufs.x = p;          p += (size_t)new_len * dim;
+    g_enc_bufs.x_norm = p;     p += (size_t)new_len * dim;
+    g_enc_bufs.q = p;          p += (size_t)new_len * qkv_dim;
+    g_enc_bufs.k = p;          p += (size_t)new_len * qkv_dim;
+    g_enc_bufs.v = p;          p += (size_t)new_len * qkv_dim;
+    g_enc_bufs.attn_out = p;   p += (size_t)new_len * qkv_dim;
+    g_enc_bufs.proj_out = p;   p += (size_t)new_len * dim;
+    g_enc_bufs.gate = p;       p += (size_t)new_len * hidden;
+    g_enc_bufs.up = p;         p += (size_t)new_len * hidden;
+    g_enc_bufs.ffn_out = p;    p += (size_t)new_len * dim;
+    g_enc_bufs.rope_freqs = p;
+
+    g_enc_bufs.base = buf;
+    g_enc_bufs.capacity = new_len;
+    return 0;
+}
+
+/* ========================================================================
  * Matrix Multiplication
  * ======================================================================== */
 
@@ -525,6 +820,11 @@ extern "C" void vox_cuda_warmup_bf16(const uint16_t *bf16_weights, size_t num_el
     weight_cache_get_or_upload(bf16_weights, num_elements);
 }
 
+extern "C" void vox_cuda_warmup_f32(const float *f32_weights, size_t num_elements) {
+    if (!g_initialized || !f32_weights) return;
+    f32_cache_get_or_upload(f32_weights, num_elements);
+}
+
 /* ========================================================================
  * Shared Memory (Unified Memory)
  * ======================================================================== */
@@ -563,4 +863,246 @@ extern "C" void vox_cuda_shared_free(void *ptr) {
 
 extern "C" size_t vox_cuda_memory_used(void) {
     return g_memory_used;
+}
+
+/* ========================================================================
+ * Monolithic Decoder Step (single token generation)
+ *
+ * All 26 layers + final norm + logits on GPU with ONE cudaStreamSynchronize.
+ * KV writes go device→managed (no page thrashing).
+ * Returns argmax token ID, or -1 on failure.
+ * ======================================================================== */
+
+extern "C" int vox_cuda_decoder_step(void *ctx_, const float *input_embeds,
+                                      const float *rope_freqs, float *logits) {
+    vox_ctx_t *ctx = (vox_ctx_t *)ctx_;
+    if (!g_initialized) return -1;
+    if (ensure_dec_gpu_bufs() != 0) return -1;
+    const int dim = VOX_DEC_DIM;
+    const int n_heads = VOX_DEC_HEADS;
+    const int n_kv_heads = VOX_DEC_KV_HEADS;
+    const int head_dim = VOX_DEC_HEAD_DIM;
+    const int hidden = VOX_DEC_HIDDEN;
+    const int q_dim = n_heads * head_dim;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int pos = ctx->kv_cache_len;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* Upload input + rope freqs */
+    cudaMemcpyAsync(g_dec_bufs.x, input_embeds, dim * sizeof(float),
+                    cudaMemcpyHostToDevice, g_stream);
+    cudaMemcpyAsync(g_dec_bufs.rope_freqs, rope_freqs, head_dim * sizeof(float),
+                    cudaMemcpyHostToDevice, g_stream);
+
+    for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
+        vox_dec_layer_t *l = &ctx->decoder.layers[layer];
+
+        /* --- Attention --- */
+        float *d_anorm = f32_cache_get_or_upload(l->attention_norm, dim);
+        kernel_rms_norm<<<1, 256, 256 * sizeof(float), g_stream>>>(
+            g_dec_bufs.x_norm, g_dec_bufs.x, d_anorm, dim, VOX_DEC_NORM_EPS);
+
+        sgemm_bf16_dev(1, q_dim, dim, g_dec_bufs.x_norm, l->wq_weight_bf16, g_dec_bufs.q);
+        sgemm_bf16_dev(1, kv_dim, dim, g_dec_bufs.x_norm, l->wk_weight_bf16, g_dec_bufs.k);
+        sgemm_bf16_dev(1, kv_dim, dim, g_dec_bufs.x_norm, l->wv_weight_bf16, g_dec_bufs.v);
+
+        kernel_apply_rope<<<n_heads, head_dim / 2, 0, g_stream>>>(
+            g_dec_bufs.q, g_dec_bufs.rope_freqs, 1, n_heads, head_dim);
+        kernel_apply_rope<<<n_kv_heads, head_dim / 2, 0, g_stream>>>(
+            g_dec_bufs.k, g_dec_bufs.rope_freqs, 1, n_kv_heads, head_dim);
+
+        /* Write K,V to managed cache (device→managed, pages stay on GPU) */
+        float *ck = ctx->kv_cache_k + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
+        float *cv = ctx->kv_cache_v + ((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
+        cudaMemcpyAsync(ck, g_dec_bufs.k, kv_dim * sizeof(float),
+                        cudaMemcpyDeviceToDevice, g_stream);
+        cudaMemcpyAsync(cv, g_dec_bufs.v, kv_dim * sizeof(float),
+                        cudaMemcpyDeviceToDevice, g_stream);
+
+        /* Attention: Q on device, K/V in managed memory */
+        int total_seq = pos + 1;
+        float *fk = ctx->kv_cache_k + (size_t)layer * ctx->kv_cache_max * kv_dim;
+        float *fv = ctx->kv_cache_v + (size_t)layer * ctx->kv_cache_max * kv_dim;
+
+        int n_warps = (head_dim + 31) / 32;
+        kernel_causal_attention<<<dim3(n_heads, 1), dim3(head_dim),
+                                  n_warps * sizeof(float), g_stream>>>(
+            g_dec_bufs.attn_out, g_dec_bufs.q, fk, fv,
+            total_seq, n_heads, n_kv_heads, head_dim, scale,
+            VOX_DEC_WINDOW, pos);
+
+        sgemm_bf16_dev(1, dim, q_dim, g_dec_bufs.attn_out, l->wo_weight_bf16, g_dec_bufs.proj_out);
+        kernel_add_inplace<<<(dim + 255) / 256, 256, 0, g_stream>>>(
+            g_dec_bufs.x, g_dec_bufs.proj_out, dim);
+
+        /* --- FFN --- */
+        float *d_fnorm = f32_cache_get_or_upload(l->ffn_norm, dim);
+        kernel_rms_norm<<<1, 256, 256 * sizeof(float), g_stream>>>(
+            g_dec_bufs.x_norm, g_dec_bufs.x, d_fnorm, dim, VOX_DEC_NORM_EPS);
+
+        if (ctx->ada_scale) {
+            float *d_ada = f32_cache_get_or_upload(ctx->ada_scale + (size_t)layer * dim, dim);
+            kernel_ada_scale<<<(dim + 255) / 256, 256, 0, g_stream>>>(
+                g_dec_bufs.x_norm, d_ada, dim, dim);
+        }
+
+        sgemm_bf16_dev(1, hidden, dim, g_dec_bufs.x_norm, l->w1_weight_bf16, g_dec_bufs.gate);
+        kernel_silu<<<(hidden + 255) / 256, 256, 0, g_stream>>>(g_dec_bufs.gate, hidden);
+        sgemm_bf16_dev(1, hidden, dim, g_dec_bufs.x_norm, l->w3_weight_bf16, g_dec_bufs.up);
+        kernel_mul_inplace<<<(hidden + 255) / 256, 256, 0, g_stream>>>(
+            g_dec_bufs.gate, g_dec_bufs.up, hidden);
+        sgemm_bf16_dev(1, dim, hidden, g_dec_bufs.gate, l->w2_weight_bf16, g_dec_bufs.ffn_out);
+        kernel_add_inplace<<<(dim + 255) / 256, 256, 0, g_stream>>>(
+            g_dec_bufs.x, g_dec_bufs.ffn_out, dim);
+
+    }
+
+    /* Final norm + logits */
+    float *d_fnorm = f32_cache_get_or_upload(ctx->decoder.norm, dim);
+    kernel_rms_norm<<<1, 256, 256 * sizeof(float), g_stream>>>(
+        g_dec_bufs.x, g_dec_bufs.x, d_fnorm, dim, VOX_DEC_NORM_EPS);
+    sgemm_bf16_dev(1, VOX_VOCAB_SIZE, dim, g_dec_bufs.x,
+                   ctx->decoder.tok_embeddings_bf16, g_dec_bufs.logits);
+
+    /* Download logits — single sync for the entire step */
+    cudaMemcpyAsync(logits, g_dec_bufs.logits, VOX_VOCAB_SIZE * sizeof(float),
+                    cudaMemcpyDeviceToHost, g_stream);
+    cudaStreamSynchronize(g_stream);
+
+    /* Check for CUDA errors (deferred from kernel launches) */
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA decoder step error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    ctx->kv_cache_len = pos + 1;
+
+    /* Argmax */
+    int best = 0;
+    float best_val = logits[0];
+    for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
+        if (logits[i] > best_val) { best_val = logits[i]; best = i; }
+    }
+    return best;
+}
+
+/* ========================================================================
+ * Monolithic Encoder Step (incremental, new_len positions)
+ *
+ * All 32 layers + final norm on GPU with ONE cudaStreamSynchronize.
+ * x is modified in-place (input: new positions, output: normed result).
+ * Returns 0 on success, -1 on failure.
+ * ======================================================================== */
+
+extern "C" int vox_cuda_encoder_step(void *ctx_, float *x, int new_len,
+                                      const float *rope_freqs, int cache_len) {
+    vox_ctx_t *ctx = (vox_ctx_t *)ctx_;
+    if (!g_initialized) return -1;
+    if (ensure_enc_gpu_bufs(new_len) != 0) return -1;
+
+    const int dim = VOX_ENC_DIM;
+    const int n_heads = VOX_ENC_HEADS;
+    const int n_kv_heads = VOX_ENC_KV_HEADS;
+    const int head_dim = VOX_ENC_HEAD_DIM;
+    const int hidden = VOX_ENC_HIDDEN;
+    const int qkv_dim = n_heads * head_dim;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* Upload x and rope freqs */
+    cudaMemcpyAsync(g_enc_bufs.x, x, (size_t)new_len * dim * sizeof(float),
+                    cudaMemcpyHostToDevice, g_stream);
+    size_t rope_bytes = (size_t)new_len * (head_dim / 2) * 2 * sizeof(float);
+    cudaMemcpyAsync(g_enc_bufs.rope_freqs, rope_freqs, rope_bytes,
+                    cudaMemcpyHostToDevice, g_stream);
+
+    for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
+        vox_enc_layer_t *l = &ctx->encoder.layers[layer];
+
+        /* --- Attention --- */
+        float *d_anorm = f32_cache_get_or_upload(l->attention_norm, dim);
+        kernel_rms_norm<<<new_len, 256, 256 * sizeof(float), g_stream>>>(
+            g_enc_bufs.x_norm, g_enc_bufs.x, d_anorm, dim, VOX_ENC_NORM_EPS);
+
+        sgemm_bf16_dev(new_len, qkv_dim, dim, g_enc_bufs.x_norm, l->wq_weight_bf16, g_enc_bufs.q);
+        sgemm_bf16_dev(new_len, qkv_dim, dim, g_enc_bufs.x_norm, l->wk_weight_bf16, g_enc_bufs.k);
+        sgemm_bf16_dev(new_len, qkv_dim, dim, g_enc_bufs.x_norm, l->wv_weight_bf16, g_enc_bufs.v);
+
+        /* Add biases (wq has bias, wk has NO bias, wv has bias) */
+        int q_total = new_len * qkv_dim;
+        float *d_wq_bias = f32_cache_get_or_upload(l->wq_bias, qkv_dim);
+        float *d_wv_bias = f32_cache_get_or_upload(l->wv_bias, qkv_dim);
+        kernel_bias_add<<<(q_total + 255) / 256, 256, 0, g_stream>>>(
+            g_enc_bufs.q, d_wq_bias, q_total, qkv_dim);
+        kernel_bias_add<<<(q_total + 255) / 256, 256, 0, g_stream>>>(
+            g_enc_bufs.v, d_wv_bias, q_total, qkv_dim);
+
+        kernel_apply_rope<<<new_len * n_heads, head_dim / 2, 0, g_stream>>>(
+            g_enc_bufs.q, g_enc_bufs.rope_freqs, new_len, n_heads, head_dim);
+        kernel_apply_rope<<<new_len * n_heads, head_dim / 2, 0, g_stream>>>(
+            g_enc_bufs.k, g_enc_bufs.rope_freqs, new_len, n_heads, head_dim);
+
+        /* Write K,V to managed cache */
+        float *ck = ctx->enc_kv_cache_k + ((size_t)layer * ctx->enc_kv_cache_max + cache_len) * qkv_dim;
+        float *cv = ctx->enc_kv_cache_v + ((size_t)layer * ctx->enc_kv_cache_max + cache_len) * qkv_dim;
+        cudaMemcpyAsync(ck, g_enc_bufs.k, (size_t)new_len * qkv_dim * sizeof(float),
+                        cudaMemcpyDeviceToDevice, g_stream);
+        cudaMemcpyAsync(cv, g_enc_bufs.v, (size_t)new_len * qkv_dim * sizeof(float),
+                        cudaMemcpyDeviceToDevice, g_stream);
+
+        /* Attention */
+        int total_kv = cache_len + new_len;
+        float *fk = ctx->enc_kv_cache_k + (size_t)layer * ctx->enc_kv_cache_max * qkv_dim;
+        float *fv = ctx->enc_kv_cache_v + (size_t)layer * ctx->enc_kv_cache_max * qkv_dim;
+
+        int n_warps = (head_dim + 31) / 32;
+        kernel_causal_attention<<<dim3(n_heads, new_len), dim3(head_dim),
+                                  n_warps * sizeof(float), g_stream>>>(
+            g_enc_bufs.attn_out, g_enc_bufs.q, fk, fv,
+            total_kv, n_heads, n_kv_heads, head_dim, scale,
+            VOX_ENC_WINDOW, cache_len);
+
+        /* Output projection + bias + residual */
+        sgemm_bf16_dev(new_len, dim, qkv_dim, g_enc_bufs.attn_out, l->wo_weight_bf16, g_enc_bufs.proj_out);
+        int proj_n = new_len * dim;
+        float *d_wo_bias = f32_cache_get_or_upload(l->wo_bias, dim);
+        kernel_bias_add<<<(proj_n + 255) / 256, 256, 0, g_stream>>>(
+            g_enc_bufs.proj_out, d_wo_bias, proj_n, dim);
+        kernel_add_inplace<<<(proj_n + 255) / 256, 256, 0, g_stream>>>(
+            g_enc_bufs.x, g_enc_bufs.proj_out, proj_n);
+
+        /* --- FFN --- */
+        float *d_fnorm = f32_cache_get_or_upload(l->ffn_norm, dim);
+        kernel_rms_norm<<<new_len, 256, 256 * sizeof(float), g_stream>>>(
+            g_enc_bufs.x_norm, g_enc_bufs.x, d_fnorm, dim, VOX_ENC_NORM_EPS);
+
+        int gate_n = new_len * hidden;
+        sgemm_bf16_dev(new_len, hidden, dim, g_enc_bufs.x_norm, l->w1_weight_bf16, g_enc_bufs.gate);
+        kernel_silu<<<(gate_n + 255) / 256, 256, 0, g_stream>>>(g_enc_bufs.gate, gate_n);
+        sgemm_bf16_dev(new_len, hidden, dim, g_enc_bufs.x_norm, l->w3_weight_bf16, g_enc_bufs.up);
+        kernel_mul_inplace<<<(gate_n + 255) / 256, 256, 0, g_stream>>>(
+            g_enc_bufs.gate, g_enc_bufs.up, gate_n);
+        sgemm_bf16_dev(new_len, dim, hidden, g_enc_bufs.gate, l->w2_weight_bf16, g_enc_bufs.ffn_out);
+
+        /* Add w2 bias + residual */
+        int ffn_n = new_len * dim;
+        float *d_w2_bias = f32_cache_get_or_upload(l->w2_bias, dim);
+        kernel_bias_add<<<(ffn_n + 255) / 256, 256, 0, g_stream>>>(
+            g_enc_bufs.ffn_out, d_w2_bias, ffn_n, dim);
+        kernel_add_inplace<<<(ffn_n + 255) / 256, 256, 0, g_stream>>>(
+            g_enc_bufs.x, g_enc_bufs.ffn_out, ffn_n);
+    }
+
+    /* Final norm */
+    float *d_enorm = f32_cache_get_or_upload(ctx->encoder.norm, dim);
+    kernel_rms_norm<<<new_len, 256, 256 * sizeof(float), g_stream>>>(
+        g_enc_bufs.x, g_enc_bufs.x, d_enorm, dim, VOX_ENC_NORM_EPS);
+
+    /* Download result — single sync for entire step */
+    cudaMemcpyAsync(x, g_enc_bufs.x, (size_t)new_len * dim * sizeof(float),
+                    cudaMemcpyDeviceToHost, g_stream);
+    cudaStreamSynchronize(g_stream);
+
+    ctx->enc_kv_cache_len = cache_len + new_len;
+    return 0;
 }

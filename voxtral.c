@@ -293,6 +293,26 @@ vox_ctx_t *vox_load(const char *model_dir) {
         vox_cuda_warmup_bf16(ctx->decoder.tok_embeddings_bf16,
                              (size_t)VOX_VOCAB_SIZE * VOX_DEC_DIM);
 
+        /* Pre-warm f32 weights (norms, biases, ada_scale) for monolithic GPU steps */
+        for (int i = 0; i < VOX_ENC_LAYERS; i++) {
+            vox_enc_layer_t *l = &ctx->encoder.layers[i];
+            vox_cuda_warmup_f32(l->attention_norm, VOX_ENC_DIM);
+            vox_cuda_warmup_f32(l->ffn_norm, VOX_ENC_DIM);
+            vox_cuda_warmup_f32(l->wq_bias, VOX_ENC_HEADS * VOX_ENC_HEAD_DIM);
+            vox_cuda_warmup_f32(l->wv_bias, VOX_ENC_HEADS * VOX_ENC_HEAD_DIM);
+            vox_cuda_warmup_f32(l->wo_bias, VOX_ENC_DIM);
+            vox_cuda_warmup_f32(l->w2_bias, VOX_ENC_DIM);
+        }
+        vox_cuda_warmup_f32(ctx->encoder.norm, VOX_ENC_DIM);
+        for (int i = 0; i < VOX_DEC_LAYERS; i++) {
+            vox_dec_layer_t *l = &ctx->decoder.layers[i];
+            vox_cuda_warmup_f32(l->attention_norm, VOX_DEC_DIM);
+            vox_cuda_warmup_f32(l->ffn_norm, VOX_DEC_DIM);
+            if (ctx->ada_scale)
+                vox_cuda_warmup_f32(ctx->ada_scale + (size_t)i * VOX_DEC_DIM, VOX_DEC_DIM);
+        }
+        vox_cuda_warmup_f32(ctx->decoder.norm, VOX_DEC_DIM);
+
         /* Pre-allocate KV caches (unified memory) */
         vox_decoder_kv_cache_preallocate(ctx, VOX_DEC_WINDOW + 1024);
         vox_encoder_kv_cache_preallocate(ctx, VOX_ENC_WINDOW + 256);
