@@ -19,6 +19,9 @@
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,6 +124,12 @@ static int kv_cache_init(vox_ctx_t *ctx, int max_seq) {
         ctx->kv_cache_v = (float *)vox_metal_shared_alloc(cache_size);
     } else
 #endif
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        ctx->kv_cache_k = (float *)vox_cuda_shared_alloc(cache_size);
+        ctx->kv_cache_v = (float *)vox_cuda_shared_alloc(cache_size);
+    } else
+#endif
     {
         ctx->kv_cache_k = (float *)calloc(1, cache_size);
         ctx->kv_cache_v = (float *)calloc(1, cache_size);
@@ -157,14 +166,23 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
         new_v = (float *)vox_metal_shared_alloc(total);
     } else
 #endif
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        new_k = (float *)vox_cuda_shared_alloc(total);
+        new_v = (float *)vox_cuda_shared_alloc(total);
+    } else
+#endif
     {
         new_k = (float *)calloc(1, total);
         new_v = (float *)calloc(1, total);
     }
     if (!new_k || !new_v) {
-#ifdef USE_METAL
+#if defined(USE_METAL)
         vox_metal_shared_free(new_k);
         vox_metal_shared_free(new_v);
+#elif defined(USE_CUDA)
+        vox_cuda_shared_free(new_k);
+        vox_cuda_shared_free(new_v);
 #else
         free(new_k); free(new_v);
 #endif
@@ -177,9 +195,12 @@ static int kv_cache_grow(vox_ctx_t *ctx, int required) {
         memcpy(new_v + l * new_stride, ctx->kv_cache_v + l * old_stride, copy);
     }
 
-#ifdef USE_METAL
+#if defined(USE_METAL)
     vox_metal_shared_free(ctx->kv_cache_k);
     vox_metal_shared_free(ctx->kv_cache_v);
+#elif defined(USE_CUDA)
+    vox_cuda_shared_free(ctx->kv_cache_k);
+    vox_cuda_shared_free(ctx->kv_cache_v);
 #else
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);

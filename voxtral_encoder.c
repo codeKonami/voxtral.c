@@ -18,6 +18,9 @@
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -334,6 +337,13 @@ int vox_encoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_pos) {
     if (vox_metal_available()) {
         ctx->enc_kv_cache_k = (float *)vox_metal_shared_alloc(total);
         ctx->enc_kv_cache_v = (float *)vox_metal_shared_alloc(total);
+        ctx->enc_kv_cache_is_shared = 1;
+    } else
+#endif
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        ctx->enc_kv_cache_k = (float *)vox_cuda_shared_alloc(total);
+        ctx->enc_kv_cache_v = (float *)vox_cuda_shared_alloc(total);
         ctx->enc_kv_cache_is_shared = 1;
     } else
 #endif
